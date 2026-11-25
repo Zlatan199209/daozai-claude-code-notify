@@ -1,0 +1,499 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 60a395d..dcfd3fd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -97,6 +97,7 @@ windows = { version = "0.58", features = [
+   "Win32_System_WinRT",
+   "Win32_System_WinRT_Composition", "UI_Composition", "UI_Composition_Desktop", "System", "Foundation_Numerics",
+   "UI_Notifications_Management",
++  "Data_Xml_Dom",
+   "UI_Notifications", "ApplicationModel",
+   "Win32_System_Ole", "Win32_UI_Shell_Common", "Networking_Connectivity",
+   "Win32_Devices_DeviceAndDriverInstallation",
+diff --git a/src/app.rs b/src/app.rs
+index ae6a7cc..f83e909 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -161,6 +161,15 @@ impl Env {
+ 
+ pub use crate::messenger::{Messenger,Unread};
+ 
++/// 通知里请求留下的常驻入口：点击切到 `window`，看过或窗口消失后清除。
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ExternalTarget {
++    /// 通知来源的应用标识，用来套用系统通知的开关。
++    pub id: String,
++    pub window: isize,
++    pub name: String,
++}
++
+ /// 展开后未读胶囊的宽度、离面板的间距和每个图标占的高度。
+ pub(crate) const UNREAD_W: f32 = 40.0;
+ pub(crate) const UNREAD_GAP: f32 = 8.0;
+@@ -177,6 +186,8 @@ pub enum Cmd {
+     Media(Transport),
+     Open(PathBuf),
+     ViewMessenger(Unread),
++    /// 切到外部通知指向的窗口。
++    FocusExternal(ExternalTarget),
+     OpenUrl(String),
+     /// 需要键盘输入：外壳应让窗口可激活并取得焦点。
+     Focus,
+@@ -840,6 +851,8 @@ pub struct App {
+     notice_width: Spring,
+     notice_details: bool,
+     pub pending_messengers:Vec<Unread>,
++    /// 带目标窗口的外部通知入口，与聊天客户端未读共用右侧图标排。
++    pub external_targets:Vec<ExternalTarget>,
+     messenger_scroll: f32,
+     pub(crate) alerts: std::collections::VecDeque<Alert>,
+     pub(crate) history: std::collections::VecDeque<Alert>,
+@@ -993,7 +1006,7 @@ impl App {
+             music_artwork: None,
+             forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
+             listener_status: "尚未连接".into(),
+-            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
++            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(),external_targets:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
+             todo_first: 0, todo_choosing: false, pet: Default::default(), last_drink: None,
+             toast: None, toast_below: false,
+             last_input: 0.0, system_idle: None,
+@@ -2331,7 +2344,7 @@ impl App {
+     fn unread_slot(&self,height:f32)->f32 {
+         if self.unread_count()>=3 {(height-4.0)/3.0} else {UNREAD_SLOT}
+     }
+-    fn unread_count(&self)->usize {self.pending_messengers.len()+self.health_badges().len()}
++    pub(crate) fn unread_count(&self)->usize {self.pending_messengers.len()+self.health_badges().len()+self.external_targets.len()}
+     /// 收起时叠放的来源图标，每个客户端各占一个。
+     fn unread_sources(&self)->Vec<Messenger>{
+         let mut sources=Vec::new();
+@@ -2340,7 +2353,7 @@ impl App {
+     }
+     /// 收起时叠放区沿胶囊方向的长度。
+     fn unread_stack_len(&self,horizontal:bool)->f32 {
+-        let icons=(self.unread_sources().len()+self.health_badges().len()) as f32;
++        let icons=(self.unread_sources().len()+self.health_badges().len()+self.external_targets.len()) as f32;
+         32.0+unread_step(horizontal)*(icons-1.0)
+     }
+ 
+@@ -2383,6 +2396,7 @@ impl App {
+     /// 展开后的未读胶囊：每个账号一个图标，点击跳到对应窗口；超过三个时滚轮翻看。
+     fn draw_unread_capsule(&mut self,ctx:&egui::Context,c:&Card,rect:Rect,cursor:Option<Pos2>,cmds:&mut Vec<Cmd>){
+         let n=self.unread_count();
++        let health_len=self.health_badges().len();
+         let height=rect.height()/c.s;
+         let slot=self.unread_slot(height);
+         let max_scroll=(n as f32-3.0).max(0.0)*slot;
+@@ -2419,6 +2433,15 @@ impl App {
+             let button=crate::quota_ui::bar_tooltip(inner.hit(0.0,cy-slot/2.0,UNREAD_W,slot,kind.id().to_string()),format!("{} · 点击确认，重新计时",kind.label()));
+             if button.clicked(){self.confirm_health_reminder(kind);}
+         }
++        for (i,target) in self.external_targets.iter().enumerate() {
++            let cy=2.0+slot*((self.pending_messengers.len()+health_len+i) as f32+0.5)-self.messenger_scroll;
++            if cy< -slot || cy>height+slot {continue;}
++            crate::extras::external_icon(&inner,x,cy);
++            inner.circle(x+10.0,cy-9.0,2.6,Color32::from_rgb(255,72,72));
++            let id=format!("external-{}",target.window);
++            let button=inner.hit(0.0,cy-slot/2.0,UNREAD_W,slot,id).on_hover_text(format!("切回 {}",target.name));
++            if button.clicked(){cmds.push(Cmd::FocusExternal(target.clone()));}
++        }
+         if max_scroll>0.0 {
+             // 还有没露出的图标：上下边缘各一条淡淡的指示。
+             let ink=paint::alpha(theme::WHITE,0.35);
+@@ -2431,8 +2454,9 @@ impl App {
+     fn draw_unread_stack(&mut self,c:&Card,horizontal:bool,cmds:&mut Vec<Cmd>){
+         let sources=self.unread_sources();
+         let health=self.health_badges();
++        let health_len=health.len();
+         let count=self.pending_messengers.len();
+-        let icons=sources.len()+health.len();
++        let icons=sources.len()+health_len+self.external_targets.len();
+         let step=unread_step(horizontal);
+         let at=|k:usize|if horizontal {(16.0+step*k as f32,14.0)}else{(16.0,14.0+step*k as f32)};
+         for k in 0..sources.len() {
+@@ -2441,10 +2465,12 @@ impl App {
+             crate::extras::messenger_icon(&c.scaled(x,y,scale),x,y,sources[k]);
+         }
+         for (i,kind) in health.iter().enumerate(){let (x,y)=at(sources.len()+i);kind.icon(c,x,y,0.7);}
++        // 外部通知的入口排在健康角标之后，各占一格。
++        for (i,_) in self.external_targets.iter().enumerate(){let (x,y)=at(sources.len()+health_len+i);crate::extras::external_icon(c,x,y);}
+         // 每个来源图标右上角一个小红点，不显示数字。
+         for k in 0..icons {let (x,y)=at(k);c.circle(x+8.0,y-7.0,2.6,Color32::from_rgb(255,59,48));}
+         let length=self.unread_stack_len(horizontal);
+-        let messenger_length=if health.is_empty(){length}else{sources.len() as f32*step+if horizontal{5.0}else{3.0}};
++        let messenger_length=if health_len==0 && self.external_targets.is_empty(){length}else{sources.len() as f32*step+if horizontal{5.0}else{3.0}};
+         let (w,h)=if horizontal {(messenger_length,BAR_H)}else{(32.0,messenger_length)};
+         if count==1 {
+             let u=self.pending_messengers[0];
+@@ -2462,6 +2488,16 @@ impl App {
+             let button=if horizontal{c.hit(start,0.0,end-start,BAR_H,kind.id().to_string())}else{c.hit(0.0,start,32.0,end-start,kind.id().to_string())};
+             if crate::quota_ui::bar_tooltip(button,format!("{} · 点击确认，重新计时",kind.label())).clicked(){self.confirm_health_reminder(kind);}
+         }
++        // 外部通知的入口：各占一格，点击切到它的窗口。
++        for (i,target) in self.external_targets.iter().enumerate() {
++            let k=sources.len()+health_len+i;
++            let (x,y)=at(k);
++            let start=if k==0{0.0}else{(if horizontal{x}else{y})-step/2.0};
++            let end=if k+1==icons{length}else{(if horizontal{x}else{y})+step/2.0};
++            let id=format!("external-{}",target.window);
++            let button=if horizontal{c.hit(start,0.0,end-start,BAR_H,id)}else{c.hit(0.0,start,32.0,end-start,id)};
++            if button.on_hover_text(format!("切回 {}",target.name)).clicked(){cmds.push(Cmd::FocusExternal(target.clone()));}
++        }
+     }
+     /// 展开面板，让旁边的未读胶囊露出来。
+     pub(crate) fn reveal_unread(&mut self){
+diff --git a/src/external_shortcut_ui_tests.rs b/src/external_shortcut_ui_tests.rs
+new file mode 100644
+index 0000000..c1957c0
+--- /dev/null
++++ b/src/external_shortcut_ui_tests.rs
+@@ -0,0 +1,133 @@
++//! 外部通知常驻入口：通知带目标窗口时，收起态右侧留下图标，点击请求外壳切到该窗口。
++use super::*;
++
++const SOURCE:&str="claude.test";
++
++fn ready() -> H {
++    let mut h=H::new();h.frame(vec![]);
++    h.app.settings.read_notifications=true;h.app.settings.notifications=true;
++    h.frame(vec![]);
++    h
++}
++/// egui 在每帧结束时交换 this_pass / prev_pass，而 `read_response` 先查 this_pass：
++/// 刚跑完一帧时读到的是上一帧的控件。所以状态变化后要连跑两帧再读，和健康角标的测试一个做法。
++fn settle(h:&mut H){h.frame(vec![]);h.frame(vec![]);}
++fn receive(h:&mut H,window:isize,name:&str) {
++    h.app.receive_external_target("Windows PowerShell".into(),SOURCE.into(),window,name.into());
++    settle(h);
++}
++fn entry(h:&H,window:isize) -> Rect {
++    h.ctx.read_response(egui::Id::new(("card",true,format!("external-{window}")))).unwrap_or_else(||panic!("缺少窗口 {window} 的常驻入口")).rect
++}
++fn missing(h:&H,window:isize) -> bool {
++    h.ctx.read_response(egui::Id::new(("card",true,format!("external-{window}")))).is_none()
++}
++fn focus_requests(h:&H) -> Vec<isize> {
++    h.cmds.iter().filter_map(|cmd|match cmd{crate::app::Cmd::FocusExternal(target)=>Some(target.window),_=>None}).collect()
++}
++
++#[test]
++fn focus_requests_follow_the_launch_attribute_format(){
++    assert_eq!(crate::system::parse_focus("daozai-focus:4242:Claude Code"),Some((4242,"Claude Code".into())));
++    assert_eq!(crate::system::parse_focus("daozai-focus: 7 : Terminal "),Some((7,"Terminal".into())));
++    assert_eq!(crate::system::parse_focus("daozai-focus:4242:"),Some((4242,"外部应用".into())));
++    assert_eq!(crate::system::parse_focus("daozai-focus:4242:Cla\tude Code").unwrap().1,"Claude Code");
++    let (_,name)=crate::system::parse_focus(&format!("daozai-focus:4242:{}","名".repeat(40))).unwrap();
++    assert_eq!(name.chars().count(),24);
++    for invalid in ["","https://example.com","daozai-focus:0:Claude Code","daozai-focus:abc:Claude Code","daozai-focus:4242"]{
++        assert_eq!(crate::system::parse_focus(invalid),None,"{invalid:?} 不应被当成请求");
++    }
++}
++
++#[test]
++fn external_focus_request_leaves_a_persistent_entry(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();
++    receive(&mut h,4242,"Claude Code");
++    assert_eq!(h.app.external_targets.len(),1);assert_eq!(h.app.unread_count(),1);
++    let rect=entry(&h,4242);
++    assert!(rect.width()>10.0 && rect.height()>10.0,"{rect:?}");
++    h.t+=10.0;h.frame(vec![]);
++    assert!(entry(&h,4242).width()>10.0,"横幅消失后入口仍要保留");
++}
++
++#[test]
++fn external_entries_dedupe_by_window_and_line_up(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();
++    receive(&mut h,4242,"Claude Code");receive(&mut h,4242,"Claude Code 2");receive(&mut h,5151,"Claude Code");
++    assert_eq!(h.app.external_targets.len(),2);
++    assert_eq!(h.app.external_targets[0].name,"Claude Code 2","同一窗口只留一条，后到的更新名称");
++    let (a,b)=(entry(&h,4242),entry(&h,5151));
++    assert!(a.right()<=b.left()+0.5,"两个入口不能重叠：{a:?} {b:?}");
++}
++
++#[test]
++fn clicking_an_external_entry_asks_the_shell_to_focus_its_window(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();
++    receive(&mut h,4242,"Claude Code");
++    let p=entry(&h,4242).center();
++    h.hover(p,0.6);h.click(p);
++    assert_eq!(focus_requests(&h),[4242]);
++    assert_eq!(h.app.external_targets.len(),1,"点击只发出命令，由外壳在切换成功后清除");
++}
++
++#[test]
++fn external_entries_clear_after_viewing_or_when_the_window_is_gone(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();
++    receive(&mut h,4242,"Claude Code");receive(&mut h,5151,"Claude Code");
++    assert!(h.app.viewed_external(4242));assert_eq!(h.app.external_targets.len(),1);
++    settle(&mut h);assert!(missing(&h,4242));assert!(!missing(&h,5151));
++    h.app.retain_external_targets(|window|window!=5151);assert!(h.app.external_targets.is_empty());
++    settle(&mut h);assert!(missing(&h,5151));assert_eq!(h.app.unread_count(),0);
++    assert!(!h.app.viewed_external(4242),"没有该窗口的入口时返回 false");
++}
++
++#[test]
++fn external_entries_stay_clickable_in_the_expanded_capsule(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();
++    receive(&mut h,4242,"Claude Code");
++    h.app.reveal_unread();
++    for _ in 0..120{h.frame(vec![]);}
++    assert!(h.app.messenger_appear()>0.9);
++    let p=entry(&h,4242).center();
++    h.hover(p,0.3);h.click(p);
++    assert_eq!(focus_requests(&h),[4242]);
++}
++
++#[test]
++fn external_entries_follow_the_notification_switches(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();
++    receive(&mut h,4242,"Claude Code");
++    h.app.settings.qq_only=true;h.frame(vec![]);assert!(h.app.external_targets.is_empty(),"只连接 QQ 时不保留");
++    h.app.settings.qq_only=false;receive(&mut h,4242,"Claude Code");assert_eq!(h.app.external_targets.len(),1);
++    h.app.notification_apps.items[0].2=false;h.frame(vec![]);assert!(h.app.external_targets.is_empty(),"来源被关闭后不保留");
++    h.app.notification_apps.items.clear();receive(&mut h,4242,"Claude Code");assert_eq!(h.app.external_targets.len(),1,"新来源默认放行");
++    h.app.settings.read_notifications=false;h.frame(vec![]);assert!(h.app.external_targets.is_empty(),"断开系统通知后不保留");
++    h.app.settings.read_notifications=true;receive(&mut h,0,"Claude Code");assert!(h.app.external_targets.is_empty(),"句柄为 0 的请求忽略");
++    receive(&mut h,4242,"Claude Code");h.app.settings.notifications=false;h.frame(vec![]);
++    assert!(h.app.external_targets.is_empty(),"总开关关闭后不保留");
++}
++
++#[test]
++fn external_entries_leave_messenger_unread_untouched(){
++    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=ready();h.app.settings.wechat_notifications=true;
++    h.app.receive_wechat_reminder();h.app.alerts.clear();h.app.notice=None;
++    receive(&mut h,4242,"Claude Code");
++    assert_eq!(h.app.pending_messengers.len(),1);assert_eq!(h.app.unread_count(),2);
++    let wechat=h.ctx.read_response(egui::Id::new(("card",true,"微信"))).unwrap_or_else(||panic!("缺少微信入口")).rect;
++    let external=entry(&h,4242);
++    assert!(wechat.right()<=external.left()+0.5,"微信入口与外部入口不能重叠：{wechat:?} {external:?}");
++    h.hover(wechat.center(),0.6);h.click(wechat.center());
++    assert!(h.cmds.iter().any(|cmd|matches!(cmd,crate::app::Cmd::ViewMessenger(unread) if unread.source==crate::app::Messenger::Wechat)),"微信入口仍要发出查看命令：{:?}",h.cmds);
++    assert!(focus_requests(&h).is_empty());
++    h.cmds.clear();h.cursor=None;h.frame(vec![]);
++    let external=entry(&h,4242);h.hover(external.center(),0.3);h.click(external.center());
++    assert_eq!(focus_requests(&h),[4242]);
++}
++
++#[test]
++fn focus_requests_can_also_arrive_at_the_end_of_the_body(){
++    let (body,focus)=crate::system::body_focus("Claude Code · 执行完成 · 16:00:00 · daozai-focus:4242:Claude Code");
++    assert_eq!(focus,Some((4242,"Claude Code".into())));assert_eq!(body,"Claude Code · 执行完成 · 16:00:00");
++    let (body,focus)=crate::system::body_focus("没有请求的正文");
++    assert_eq!((body.as_str(),focus),("没有请求的正文",None));
++}
+diff --git a/src/extras.rs b/src/extras.rs
+index 7e07670..6f311af 100644
+--- a/src/extras.rs
++++ b/src/extras.rs
+@@ -95,6 +95,13 @@ pub(crate) fn notice_badge(c:&Card,x:f32,y:f32,a:&Alert){
+     }else{notice_icon(&c.scaled(x,y,0.85),x,y,a);}
+ }
+ pub(crate) fn messenger_icon(c:&Card,x:f32,y:f32,source:crate::app::Messenger){(source.adapter().paint_icon)(c,x,y);}
++/// 外部通知的常驻入口图标：橙色圆角方块加白色星芒。
++pub(crate) fn external_icon(c:&Card,x:f32,y:f32){
++    c.fill(x-9.5,y-9.5,19.0,19.0,5.5,Color32::from_rgb(217,119,87));
++    for (ax,ay,bx,by) in [(0.0,-6.5,0.0,6.5),(-6.5,0.0,6.5,0.0),(-4.4,-4.4,4.4,4.4),(-4.4,4.4,4.4,-4.4)]{
++        c.seg((x+ax,y+ay),(x+bx,y+by),1.8,theme::WHITE);
++    }
++}
+ fn notice_icon(c:&Card,x:f32,y:f32,a:&Alert) {
+     if a.source!=AlertSource::Internal{crate::paint::bell(c,x,y,theme::WHITE,0.0);return;}
+     match a.title.as_str() {
+@@ -400,6 +407,34 @@ impl App {
+         }else{"收到新通知 · 内容已隐藏".into()};
+         self.enqueue_alert(Alert{source:AlertSource::External(id),title,body,page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread},false);
+     }
++    /// 通知带着目标窗口：在右侧留下常驻入口。同一窗口只留一条，后到的更新名称。
++    /// 先登记来源再做开关检查：新来源由登记这一步默认放行，顺序反了会让第一次到来的来源永远被挡在外面。
++    pub fn receive_external_target(&mut self,app:String,id:String,window:isize,name:String){
++        if window==0 || id.is_empty() || !self.notification_apps.observe(&id,&app) || !Self::external_allowed(&self.settings,&self.notification_apps,&id){return;}
++        let name=name.chars().filter(|c|!c.is_control()).take(24).collect::<String>();
++        let name=if name.trim().is_empty(){"外部应用".to_string()}else{name.trim().to_string()};
++        match self.external_targets.iter_mut().find(|target|target.window==window){
++            Some(target)=>target.name=name,
++            None=>self.external_targets.push(crate::app::ExternalTarget{id,window,name}),
++        }
++    }
++    /// 外部通知的入口是否还有效：系统通知已连接、总开关打开、来源没被“只连接 QQ”过滤，且在应用列表里是启用状态。
++    /// 写成不带 self 的关联函数，是为了在 `retain` 的闭包里只借用 `settings` 和 `notification_apps` 两个字段，
++    /// 不和正在被遍历修改的 `external_targets` 冲突（和上面 `pending_messengers.retain` 的写法同理）。
++    fn external_allowed(settings:&crate::model::Settings,apps:&crate::model::NotificationApps,id:&str)->bool{
++        settings.read_notifications && settings.notifications
++            && crate::messenger::NotificationFilter::for_settings(settings).allows(id)
++            && apps.items.iter().any(|(key,_,on)|key==id && *on)
++    }
++    /// 该窗口来到前台或已切换成功：清掉它的入口。
++    pub fn viewed_external(&mut self,window:isize)->bool{
++        let before=self.external_targets.len();
++        self.external_targets.retain(|target|target.window!=window);
++        before!=self.external_targets.len()
++    }
++    /// 清掉窗口已不存在的入口。（参数必须声明成 `mut`：闭包要可变借用它。）
++    /// 上面三个方法对外壳（`main.rs` 是另一个 crate）开放，所以是 `pub` 而不是 `pub(crate)`。
++    pub fn retain_external_targets(&mut self,mut alive:impl FnMut(isize)->bool){self.external_targets.retain(|target|alive(target.window));}
+     pub fn reveal_messenger_notice(&mut self,unread:crate::app::Unread){
+         if !unread.source.adapter().dismiss_unread || !self.pending_messengers.contains(&unread){return;}
+         let body=if unread.pid==0{"消息账号暂无法确认"}else{"暂时无法打开对应窗口"};
+@@ -408,6 +443,7 @@ impl App {
+         self.notification_bell_at=self.t;self.notification_bell_until=self.t+4.5;
+     }
+     pub(crate) fn tick_alerts(&mut self) {
++        self.external_targets.retain(|target|Self::external_allowed(&self.settings,&self.notification_apps,&target.id));
+         self.pending_messengers.retain(|u|u.source.enabled(&self.settings) && (u.source.adapter().capture!=crate::messenger::Capture::SystemToast
+             || self.notification_apps.items.iter().any(|(key,_,on)|key==u.source.adapter().notification_id && *on)));
+         let allowed=|a:&Alert|match &a.source {
+diff --git a/src/main.rs b/src/main.rs
+index a529768..15aabf8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -131,6 +131,7 @@ impl Shell {
+             self.app.discard_unread(unread);
+             ctx.request_repaint();
+         }
++        if !self.app.external_targets.is_empty(){self.app.retain_external_targets(daozai::system::window_exists);}
+         self.unread_at=PollClock::now();
+     }
+ 
+@@ -485,8 +486,10 @@ impl eframe::App for Shell {
+                 while let Ok(event)=rx.try_recv(){match event {
+                     daozai::system::Incoming::Revoked=>{self.app.settings.read_notifications=false;self.app.settings.save();},
+                     daozai::system::Incoming::Status(s)=>self.app.listener_status=s,
+-                    daozai::system::Incoming::Message(a,id,b,target)=>{
++                    daozai::system::Incoming::Message(a,id,b,target,focus)=>{
+                         if target.is_some_and(|target|self.messengers.track(target)==Err(OpenError::Exited)){continue;}
++                        // a 是来源的显示名，id 是来源的应用标识；目标入口两样都要。
++                        if let Some((window,name))=focus{self.app.receive_external_target(a.clone(),id.clone(),window,name);}
+                         self.app.receive_notification_from(a,id,b,target.map(|target|target.unread));
+                     }
+                 }}
+@@ -494,7 +497,12 @@ impl eframe::App for Shell {
+             if self.app.pending_messengers!=previous_pending || self.unread_at.ready(Duration::from_secs(1)){
+                 self.clear_exited_messengers(ctx);
+             }
+-            if !self.app.pending_messengers.is_empty(){ctx.request_repaint_after(Duration::from_secs(1));}
++            // 外部通知的入口：它的窗口来到前台后清除（与聊天客户端未读“看过即清”一致）。
++            #[cfg(windows)]
++            if foreground_changed && !self.app.external_targets.is_empty() {
++                if let Some(root)=daozai::system::foreground_root(){self.app.viewed_external(root);}
++            }
++            if !self.app.pending_messengers.is_empty() || !self.app.external_targets.is_empty(){ctx.request_repaint_after(Duration::from_secs(1));}
+             if foreground_changed || self.app.pending_messengers!=previous_pending {
+                 // 在微信 / QQ 里打开了某个账号的窗口：清掉这个账号的未读。
+                 let mut sources:Vec<app::Messenger>=self.app.pending_messengers.iter().map(|u|u.source).collect();sources.dedup();
+@@ -685,6 +693,17 @@ impl eframe::App for Shell {
+                         _=>self.app.say("音乐应用音量暂不可调，请稍后重试"),
+                     }
+                 }
++                Cmd::FocusExternal(target)=>{
++                    #[cfg(windows)] {
++                        if !self.app.external_targets.contains(&target){continue;}
++                        match daozai::system::focus_window(target.window){
++                            Ok(())=>{self.app.viewed_external(target.window);ctx.request_repaint();}
++                            Err(daozai::system::FocusError::Exited)=>{self.app.retain_external_targets(|window|window!=target.window);self.app.say(format!("{} 的窗口已关闭",target.name));ctx.request_repaint();}
++                            Err(daozai::system::FocusError::Denied)=>{self.app.say(format!("系统暂时不允许切到 {}，可再点一次",target.name));ctx.request_repaint();}
++                        }
++                    }
++                    #[cfg(not(windows))] let _=target;
++                }
+                 Cmd::ViewMessenger(unread)=>{
+                     #[cfg(windows)] {
+                         let was_pending=self.app.pending_messengers.contains(&unread);
+diff --git a/src/system.rs b/src/system.rs
+index 98423e2..4426306 100644
+--- a/src/system.rs
++++ b/src/system.rs
+@@ -555,7 +555,8 @@ unsafe fn avoidance_for_window(foreground:HWND,island:HWND,pid:u32,settings:&cra
+ pub enum Incoming {
+     Revoked,
+     Status(String),
+-    Message(String, String, String, Option<crate::messenger::Target>),
++    /// 末尾的（窗口句柄, 名称）来自通知的 launch 属性（见 parse_focus），没有请求时为 None。
++    Message(String, String, String, Option<crate::messenger::Target>, Option<(isize, String)>),
+ }
+ #[path="toast_source.rs"]
+ mod toast_source;
+@@ -584,6 +585,50 @@ fn notification_body(n: &UserNotification) -> Result<String> {
+     }
+     Ok(parts.join(" · "))
+ }
++/// 通知用 launch 属性请求常驻入口：`daozai-focus:<窗口句柄>:<名称>`。
++/// 前缀不符、句柄不是非零整数都当作没有请求；名称去掉控制字符，最多 24 个字符。
++pub(crate) fn parse_focus(launch:&str)->Option<(isize,String)>{
++    let rest=launch.strip_prefix("daozai-focus:")?;
++    let (window,name)=rest.split_once(':')?;
++    let window=window.trim().parse::<isize>().ok().filter(|window|*window!=0)?;
++    let name=name.chars().filter(|c|!c.is_control()).take(24).collect::<String>();
++    let name=name.trim();
++    Some((window,if name.is_empty(){"外部应用".into()}else{name.to_string()}))
++}
++/// 读不到 launch 属性、或格式不对，都当作没有请求。
++/// 通知中心交回的是基类 Notification（没有 XML）；带 XML 的是派生类 ToastNotification，这里按需转换。
++fn notification_focus(n:&UserNotification)->Option<(isize,String)>{
++    use windows::core::Interface;
++    use windows::UI::Notifications::ToastNotification;
++    let toast:ToastNotification=n.Notification().ok()?.cast().ok()?;
++    let root=toast.Content().ok()?.DocumentElement().ok()?;
++    parse_focus(&root.GetAttribute(&HSTRING::from("launch")).ok()?.to_string())
++}
++/// 备选载体：launch 属性读不到时，协议串是绑定里最后一个文字元素，拼接后位于正文末尾；识别后从正文里剔除。
++/// 截取时要从 `daozai-focus:` 前缀本身开始（解析函数要求带前缀），偏移按字节长度算，不手写数字。
++pub(crate) fn body_focus(body:&str)->(String,Option<(isize,String)>){
++    const PREFIX:&str="daozai-focus:";
++    const MARK:&str=" · daozai-focus:";
++    match body.rfind(MARK){
++        Some(at)=>{let focus=parse_focus(&body[at+MARK.len()-PREFIX.len()..]);(body[..at].to_string(),focus)}
++        None=>(body.to_string(),None),
++    }
++}
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub enum FocusError{Exited,Denied}
++/// 把通知指向的窗口带到前台：最小化先还原。窗口已不存在与系统拒绝切换分别回报。
++pub fn focus_window(window:isize)->std::result::Result<(),FocusError>{unsafe{
++    let window=HWND(window as *mut _);
++    if !IsWindow(window).as_bool(){return Err(FocusError::Exited);}
++    if IsIconic(window).as_bool(){let _=ShowWindowAsync(window,SW_RESTORE);}
++    if SetForegroundWindow(window).as_bool(){Ok(())}else{Err(FocusError::Denied)}
++}}
++pub fn window_exists(window:isize)->bool{unsafe{IsWindow(HWND(window as *mut _)).as_bool()}}
++/// 当前前台窗口的根窗口；取法与钩子脚本记录目标窗口时一致。
++pub fn foreground_root()->Option<isize>{unsafe{
++    let root=GetAncestor(GetForegroundWindow(),GA_ROOT);
++    (!root.0.is_null()).then_some(root.0 as isize)
++}}
+ /// 停止信号独立于消息队列，断开后结束等待，不再读取通知。
+ pub struct Notifications {
+     incoming: Receiver<Incoming>,
+@@ -734,14 +779,18 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
+                                 if target.is_none(){crate::messenger::windows::trace(format!("通知 {id}·创建 {created} 未能绑定 {} 账号",client.name()));}
+                                 target
+                             });
+-                        if !body.trim().is_empty(){messages.push((created,app,id,body,target));}
++                        // 非内置客户端的通知可以请求常驻入口（点击切回它的窗口）：优先读 launch 属性，
++                        // 读不到再看正文末尾的备选标记；备选标记总是从正文里剔除，不会显示出来。
++                        let (body,marker)=if client.is_some(){(body,None)}else{body_focus(&body)};
++                        let focus=if client.is_some(){None}else{notification_focus(&n).or(marker)};
++                        if !body.trim().is_empty(){messages.push((created,app,id,body,target,focus));}
+                     }
+                 }
+                 baseline.finish(current,complete);
+                 accounts.retain(|client,id,created|baseline.previous.as_ref().and_then(|items|items.get(&id)).is_some_and(|item|item.created==created && item.client==Some(client)));
+                 messages.sort_by_key(|item|item.0);
+-                for (_,app,id,body,target) in messages {
+-                    if !send(Incoming::Message(app,id,body,target)){return Ok(());}
++                for (_,app,id,body,target,focus) in messages {
++                    if !send(Incoming::Message(app,id,body,target,focus)){return Ok(());}
+                 }
+                 let status=match filter{crate::messenger::NotificationFilter::Only(client)=>format!("仅监听 {} · {channels}",client.name()),crate::messenger::NotificationFilter::All=>format!("正在监听 Windows 通知 · 当前可见 {count} 条\n{channels}")};
+                 if status!=last_status {
+diff --git a/src/ui_tests.rs b/src/ui_tests.rs
+index 4f84fa0..fe15e04 100644
+--- a/src/ui_tests.rs
++++ b/src/ui_tests.rs
+@@ -14,6 +14,8 @@ mod lyrics_switch;
+ mod health_reminder;
+ #[path="settings_redesign_ui_tests.rs"]
+ mod settings_redesign;
++#[path="external_shortcut_ui_tests.rs"]
++mod external_shortcut;
+ use eframe::egui::{self, Pos2, Rect, Vec2};
+ use std::sync::Mutex;
+ 

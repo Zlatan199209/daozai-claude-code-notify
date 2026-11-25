@@ -1,0 +1,483 @@
+# 岛仔补丁版安装与 Claude Code 通知接入 — 执行指南
+
+> **本文写给 Claude Code。** 请在用户的 Windows 电脑上按顺序完成下面的设置。
+> 逐节执行，每节末尾有验证；验证不通过就停下来，把看到的现象告诉用户，不要跳到下一步。
+> 编写日期 2026-11-25，对应岛仔 v0.6.66 补丁版、Windows PowerShell 5.1。
+
+---
+
+## 0. 任务与原则
+
+**做完之后用户应得到的效果**
+
+- Claude Code 一轮回答结束时，屏幕顶部的「岛仔」弹出一条横幅，并在胶囊右侧留下一个橙色图标。
+- 点这个橙色图标，切回该会话所在的终端窗口（窗口最小化时会先还原）。
+- 切回那个窗口后，图标自动消失。
+- Windows 自己不弹系统横幅，只有岛仔提醒，并有一声提示音。
+
+**必须遵守**
+
+1. 只做本文列出的改动，不改用户的其他配置。
+2. 用户的 `~/.claude/settings.json` 里可能有明文令牌（在 `env` 字段）。**不要把整个文件打印到对话里，也不要整份重写。** 先备份，再按键增补，改完读回做结构比对。
+3. 需要用户亲手做的步骤（看屏幕、点按钮），明确告诉用户做什么，然后等用户确认。
+4. 实际情况和本文不符时：停下来说明，不要自行绕过。
+
+---
+
+## 1. 文件与环境
+
+**文件从哪来**：从本仓库的 Releases 下载压缩包并解压，本文和下面两个文件就在同一个文件夹里。如果是单独拿到本文的，请先下载 `daozai.exe`（在 Releases）和 `notify.ps1`（在本仓库根目录），放到和本文同一个文件夹。
+
+和本文同一个文件夹里应该还有两个文件：
+
+| 文件 | 说明 |
+|---|---|
+| `daozai.exe` | 补丁版岛仔主程序，基于官方 v0.6.66 |
+| `notify.ps1` | Claude Code 的钩子脚本 |
+
+**先校验补丁程序**（在本文件夹里执行）：
+
+```powershell
+(Get-FileHash -Algorithm SHA256 .\daozai.exe).Hash.ToLower()
+```
+
+期望值：`0ab8363c10ee800b9bcb149f089a34b16a7cb0490ae2f7b4a8613e5be1e7610e`。不一致就停下，不要安装。
+
+如果没有 `notify.ps1`，用附录 A 的内容创建。
+
+**环境要求**：Windows 10 / 11 x64；系统自带的 Windows PowerShell 5.1；已安装 Claude Code。全程不需要管理员权限。
+
+---
+
+## 2. 安装岛仔
+
+### 2.1 装官方版（已安装的跳到 2.2）
+
+任选一种，**版本必须是 v0.6.66**：
+
+- 安装器：`https://github.com/Renly1994/xiaotang-daozai/releases/download/v0.6.66/Daozai-Setup-v0.6.66-x64.exe`
+  SHA256 `227aeccc9d0660ac72e4c753f2ddbd5ff9e7e38d389b9cd60ae3c24394160aab`
+- 免安装 ZIP：`https://github.com/Renly1994/xiaotang-daozai/releases/download/v0.6.66/Daozai-v0.6.66-windows-x64.zip`
+  SHA256 `2b3a754be6250c5348c86e4962032d5143b8700a0af91258560fbf29fbd59ffd`，解压到 `%LOCALAPPDATA%\Programs\Daozai`
+
+下载后先校验哈希再用。官方和补丁版都没有数字签名，运行时可能出现「未知发布者」，这是已知的，需要用户点「更多信息 → 仍要运行」。下载不通时告诉用户，不要换别的来源。
+
+### 2.2 换成补丁版
+
+下面的命令在**本文件夹**里执行（`.\daozai.exe` 指补丁版）。先退出岛仔再覆盖。
+
+```powershell
+$exe = Join-Path $env:LOCALAPPDATA 'Programs\Daozai\daozai.exe'
+(Get-Item $exe).VersionInfo.FileVersion        # 必须是 0.6.66，否则停下
+Get-Process daozai -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }
+Start-Sleep 5
+Get-Process daozai -ErrorAction SilentlyContinue | Stop-Process -Force     # 上一步没退干净才需要
+$bakDir = Join-Path $env:LOCALAPPDATA 'Daozai-backup'
+New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+Copy-Item $exe (Join-Path $bakDir 'daozai-0.6.66-official.exe') -Force      # 备份官方版，回滚用
+Copy-Item .\daozai.exe $exe -Force
+(Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()                        # 应等于第 1 节的补丁哈希
+```
+
+### 2.3 启动并确认
+
+```powershell
+Start-Process $exe
+Start-Sleep 10
+Get-Process daozai | ForEach-Object { 'pid={0} responding={1}' -f $_.Id, $_.Responding }
+```
+
+**让用户看屏幕顶部**：应出现小岛（显示时间和天气）。
+
+- 没出现，或进程几秒后消失：用备份的官方版覆盖回去（`Copy-Item (Join-Path $bakDir 'daozai-0.6.66-official.exe') $exe -Force`），然后停下报告。
+- **告诉用户**：不要用岛仔设置里的「检查更新」，一更新补丁就会被官方版覆盖。
+
+---
+
+## 3. 打开岛仔的通知读取
+
+岛仔是靠读取 Windows 通知中心来提醒的，所以必须连上系统通知。
+
+岛仔只在自己没运行时才重新读配置，所以顺序是：**先退出，再改，后启动**。
+
+```powershell
+Get-Process daozai -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }
+Start-Sleep 5
+$f = Join-Path $env:APPDATA 'Daozai\settings.txt'
+Test-Path $f            # 必须是 True。是 False 说明还没生成：先启动一次岛仔、等 10 秒、再退出，然后回来
+Copy-Item $f "$f.bak"
+$lines = [System.Collections.Generic.List[string]](Get-Content $f)
+foreach ($k in 'read_notifications', 'notification_preview') {
+    $found = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].StartsWith("$k=")) { $lines[$i] = "$k=1"; $found = $true }
+    }
+    if (-not $found) { $lines.Add("$k=1") }
+}
+[IO.File]::WriteAllText($f, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+Select-String -Path $f -Pattern '^(read_notifications|notification_preview)=' | ForEach-Object { $_.Line }   # 两行都应是 =1
+Start-Process (Join-Path $env:LOCALAPPDATA 'Programs\Daozai\daozai.exe')
+```
+
+只改了这两个开关，其他行不动：
+
+- `read_notifications`：连接系统通知，**必须**。
+- `notification_preview`：横幅里显示通知正文。可选；用户在意隐私可以保持 0，那时横幅只显示「收到新通知 · 内容已隐藏」，图标不受影响。
+
+**让用户操作并确认**：鼠标靠近屏幕顶部的小岛展开 → 设置 → 通知。
+
+- 按钮显示「断开系统通知」= 已连接，正常。
+- 如果出现「Windows 未授予通知读取权限」：让用户点一下「连接系统通知」。Windows 若弹出通知访问权限的提示，选允许。
+- 还是连不上：停下，把设置页显示的状态文字告诉用户。
+
+---
+
+## 4. 接入 Claude Code 钩子
+
+### 4.1 放置脚本
+
+把 `notify.ps1` 复制到 `~/.claude/hooks/notify.ps1`（目录不存在就创建），然后检查：
+
+```powershell
+$p = Join-Path $HOME '.claude\hooks\notify.ps1'
+$b = [IO.File]::ReadAllBytes($p)
+'{0:X2} {1:X2} {2:X2}' -f $b[0], $b[1], $b[2]          # 期望 EF BB BF。脚本含中文，必须是带 BOM 的 UTF-8
+$e = $null; $t = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$t, [ref]$e)
+$e.Count                                               # 期望 0
+```
+
+### 4.2 注册钩子
+
+`~/.claude/settings.json` 的 `hooks` 下，**三个事件**都要有调用 `notify.ps1` 的条目。目标结构如下（`<用户名>` 换成实际的；JSON 里路径用正斜杠即可，若用反斜杠必须写成两个）：
+
+```json
+"hooks": {
+  "Stop": [
+    { "hooks": [ { "type": "command", "command": "powershell.exe",
+        "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/Users/<用户名>/.claude/hooks/notify.ps1"],
+        "async": true } ] }
+  ],
+  "Notification": [
+    { "matcher": "permission_prompt|idle_prompt",
+      "hooks": [ { "type": "command", "command": "powershell.exe",
+        "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/Users/<用户名>/.claude/hooks/notify.ps1"],
+        "async": true } ] }
+  ],
+  "SessionStart": [
+    { "hooks": [ { "type": "command", "command": "powershell.exe",
+        "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/Users/<用户名>/.claude/hooks/notify.ps1"],
+        "async": true } ] }
+  ]
+}
+```
+
+规则：
+
+- 先备份 `settings.json`（文件名带时间戳）。
+- 某个事件下已经有别的钩子时（`SessionStart` 常见），把新的一组**追加**到那个数组里，不要替换。
+- 已有调用 `notify.ps1` 的条目就不重复添加。
+- 改完读回：确认原有的每个键值都没变，三处钩子都在。不要在对话里显示 `env` 的内容。
+
+### 4.3 生效
+
+钩子对**新开的会话**一定生效。请用户新开一个 Claude Code 会话；也可以在当前会话运行 `/hooks`，确认三处钩子都在列表里。
+
+---
+
+## 5. 验证
+
+逐项做，如实向用户报告结果。
+
+### 5.1 脚本能发通知（你来做）
+
+```powershell
+'{"hook_event_name":"Stop","session_id":"setup-test","cwd":"D:/x","last_assistant_message":"setup test"}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.claude\hooks\notify.ps1"
+"exit=$LASTEXITCODE"          # 期望 exit=0，且上面没有红色报错
+
+$appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$hist = [Windows.UI.Notifications.ToastNotificationManager]::History
+@($hist.GetHistory($appId)) | ForEach-Object { $_.Content.GetXml() }     # 通知文字末尾应有一段 daozai-focus:<数字>:Claude Code
+$hist.Remove('ccstop', 'ClaudeCode', $appId)                             # 删掉这条测试通知
+```
+
+通知里没有 `daozai-focus:`：说明脚本找不到终端窗口（见第 6 节「图标不出现」的最后一行）。
+
+### 5.2 岛上出现横幅和图标（用户来看）
+
+再执行一次 5.1 的第一段发通知，然后让用户看屏幕顶部的小岛，确认：
+
+1. 1–3 秒内出现横幅；
+2. 约 5 秒后横幅消失，**胶囊右侧留着一个橙色圆角图标，带红点**。
+
+### 5.3 点图标切回窗口（用户来操作）
+
+请用户：把当前的终端窗口最小化 → 点小岛右侧的那个橙色图标。预期：终端窗口被还原并回到前台，图标随之消失。
+
+> 编写本文时，这一项在编写者的机器上还没完成验证。无论成功还是失败，都请把实际现象如实告诉用户。
+
+### 5.4 会话窗口已登记（你来做）
+
+用户在第 4.3 节新开会话后：
+
+```powershell
+Get-Content (Join-Path $env:LOCALAPPDATA 'ClaudeCodeNotify\sessions.json')    # 应有以新会话 ID 为键的条目
+```
+
+---
+
+## 6. 不符合预期时
+
+| 现象 | 可能原因 | 怎么做 |
+|---|---|---|
+| 小岛不出现，或启动后消失 | 补丁版与机器不兼容 | 用备份的官方版覆盖回去，停下报告 |
+| 横幅不出现 | 没连接系统通知，或 Windows 没授权 | 重做第 3 节；让用户看设置 → 通知里的状态文字 |
+| 横幅出现但没有橙色图标 | 通知里没带 `daozai-focus:` 标记 | 会话启动早于钩子安装的，只有从 Windows Terminal 里启动才能找到窗口。让用户新开一个会话再试；仍不行就报告 |
+| 横幅写着「收到新通知 · 内容已隐藏」 | 没开 `notification_preview` | 正常，属于隐私设置；想看正文就把第 3 节里的 `notification_preview` 改成 1 |
+| 完全没有提醒 | 电脑锁屏、前台是全屏程序、或岛仔处于「极简刘海」模式 | 这些状态下小岛本来就不显示；解锁、退出全屏，或把岛体外观换成普通模式 |
+| 没有「需要确认」的通知 | Claude Code 用 `--dangerously-skip-permissions` 启动，本来就没有确认框；或确认框还没挂满约 6 秒 | 属于正常。提醒只针对「一轮回答结束」和「回答完约 60 秒没输入」 |
+| 同一台电脑开着多个终端窗口，点图标切到了另一个 | 兜底逻辑分不清是哪个窗口 | 新开的会话不受影响（启动时已记下准确窗口） |
+
+---
+
+## 7. 回滚
+
+- **去掉 Claude Code 这边的接入**：用备份恢复 `settings.json`（或删掉三处钩子条目），删除 `~/.claude/hooks/notify.ps1`。
+- **恢复官方岛仔**：退出岛仔，用 `%LOCALAPPDATA%\Daozai-backup\daozai-0.6.66-official.exe` 覆盖 `%LOCALAPPDATA%\Programs\Daozai\daozai.exe`。
+- 钩子自己的数据只有 `%LOCALAPPDATA%\ClaudeCodeNotify\sessions.json` 一个文件，可以直接删。
+
+---
+
+## 附录 A：notify.ps1 完整内容
+
+保存为 `~/.claude/hooks/notify.ps1`，**UTF-8 带 BOM**（前三个字节 `EF BB BF`），否则中文会乱码。
+
+```powershell
+# Claude Code 通知钩子。
+# - SessionStart：记下会话所在的窗口（当时的前台窗口），供之后的通知指明要切回哪里。不发通知、不出声。
+# - Stop / Notification：通知只静默写入 Windows 通知中心（不弹 Windows 横幅），由「岛仔」灵动岛显示横幅；
+#   通知的 launch 属性带上目标窗口，岛仔据此在右侧留下常驻入口。提示音由本脚本播放。
+# 由 ~/.claude/settings.json 的 hooks 以 powershell.exe -File 方式调用，stdin 是事件 JSON。
+# 本文件含中文，必须保持「UTF-8 带 BOM」编码，否则 Windows PowerShell 5.1 会按 GBK 读成乱码。
+$ErrorActionPreference = 'Stop'
+
+# stdin 按 UTF-8 显式解码，避免中文在 GBK 控制台代码页下乱码。
+$ms = New-Object System.IO.MemoryStream
+[Console]::OpenStandardInput().CopyTo($ms)
+$raw = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+$h = $null
+if ($raw) { try { $h = $raw | ConvertFrom-Json } catch { } }
+
+function Get-Prop($o, [string]$name) {
+    if ($null -ne $o -and ($o.PSObject.Properties.Name -contains $name)) { return [string]$o.$name }
+    return ''
+}
+function Clean([string]$s, [int]$max) {
+    $s = ($s -replace '\s+', ' ').Trim()
+    if ($s.Length -gt $max) { $s = $s.Substring(0, $max) + '...' }
+    return $s
+}
+
+# ---- 会话窗口登记表：%LOCALAPPDATA%\ClaudeCodeNotify\sessions.json，会话 ID -> 窗口句柄 ----
+$mapDir  = Join-Path $env:LOCALAPPDATA 'ClaudeCodeNotify'
+$mapPath = Join-Path $mapDir 'sessions.json'
+
+function Read-SessionMap {
+    $map = @{}
+    if (Test-Path -LiteralPath $mapPath) {
+        try {
+            $json = Get-Content -LiteralPath $mapPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($json) { foreach ($p in $json.PSObject.Properties) { $map[$p.Name] = $p.Value } }
+        } catch { }
+    }
+    return $map
+}
+function Add-WindowNative {
+    if (-not ('ClaudeCodeNotify.Native' -as [type])) {
+        Add-Type -Namespace ClaudeCodeNotify -Name Native -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+'@
+    }
+}
+function Save-SessionWindow {
+    param([string]$sessionId)
+    if (-not $sessionId) { return }
+    Add-WindowNative
+    $window = [ClaudeCodeNotify.Native]::GetForegroundWindow()
+    if ($window -eq [IntPtr]::Zero) { return }
+    # 统一记根窗口（GA_ROOT = 2），岛仔比较前台时用同一种取法。
+    $root = [ClaudeCodeNotify.Native]::GetAncestor($window, 2)
+    if ($root -ne [IntPtr]::Zero) { $window = $root }
+    $map = Read-SessionMap
+    $keep = @{}
+    $cutoff = (Get-Date).AddDays(-30)
+    foreach ($key in @($map.Keys)) {
+        $at = $null
+        try { $at = [datetime]::Parse([string]$map[$key].at) } catch { }
+        if ($at -and $at -gt $cutoff) { $keep[$key] = $map[$key] }
+    }
+    $keep[$sessionId] = @{ window = [long]$window; at = (Get-Date).ToString('o') }
+    try {
+        [void](New-Item -ItemType Directory -Force -Path $mapDir)
+        $json = $keep | ConvertTo-Json -Depth 4 -Compress
+        $tmp = $mapPath + '.' + $PID + '.tmp'
+        [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $mapPath -Force
+    } catch { }
+}
+function Find-TerminalWindow {
+    param([int]$ProcessId)
+    # 只认 Windows Terminal 自己的顶层窗口类。.NET 的 MainWindowHandle 不可靠：会挑中输入法状态栏之类的临时窗口。
+    if (-not ('ClaudeCodeNotify.Terminal' -as [type])) {
+        Add-Type -Namespace ClaudeCodeNotify -Name Terminal -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);
+public delegate bool EnumWindowsProc(IntPtr h, IntPtr lp);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+public static IntPtr Find(uint pid) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr lp) {
+        uint id; GetWindowThreadProcessId(h, out id);
+        if (id != pid || !IsWindowVisible(h) || GetWindow(h, 4) != IntPtr.Zero) return true;
+        System.Text.StringBuilder c = new System.Text.StringBuilder(128); GetClassName(h, c, 128);
+        if (c.ToString() == "CASCADIA_HOSTING_WINDOW_CLASS" && found == IntPtr.Zero) found = h;
+        return true;
+    }, IntPtr.Zero);
+    return found;
+}
+'@
+    }
+    return [ClaudeCodeNotify.Terminal]::Find([uint32]$ProcessId)
+}
+function Find-SessionWindow {
+    param([string]$sessionId)
+    if ($sessionId) {
+        $entry = (Read-SessionMap)[$sessionId]
+        if ($entry -and [long]$entry.window -gt 0) { return [long]$entry.window }
+    }
+    # 没有登记（例如会话启动早于本钩子）：沿父进程链找 Windows Terminal 的窗口。
+    # 同一个终端进程开着多个窗口时，这里取 Z 序最靠上的那个，无法区分是哪一个；正常情况下靠会话启动时的登记。
+    $p = $PID
+    for ($i = 0; $i -lt 8; $i++) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
+        if (-not $proc -or -not $proc.ParentProcessId -or $proc.ParentProcessId -eq $p) { break }
+        $p = $proc.ParentProcessId
+        $parent = Get-Process -Id $p -ErrorAction SilentlyContinue
+        if ($parent -and $parent.ProcessName -eq 'WindowsTerminal') {
+            $terminal = Find-TerminalWindow ([int]$p)
+            if ($terminal -ne [IntPtr]::Zero) { return [long]$terminal }
+        }
+    }
+    return 0
+}
+
+$event  = Get-Prop $h 'hook_event_name'
+if ($event -eq 'SessionStart') { Save-SessionWindow (Get-Prop $h 'session_id'); exit 0 }
+
+$type   = Get-Prop $h 'notification_type'
+$stamp  = Get-Date -Format 'HH:mm:ss'
+$cwd    = Get-Prop $h 'cwd'
+$where  = ''
+if ($cwd) { $where = Clean (Split-Path $cwd -Leaf) 40 }
+$head   = 'Claude Code'
+$detail = ''
+$sound  = 'Asterisk'
+
+switch ($event) {
+    'Stop' {
+        $head   = 'Claude Code · 执行完成'
+        $detail = Get-Prop $h 'last_assistant_message'
+        $bg = @()
+        if ($null -ne $h -and ($h.PSObject.Properties.Name -contains 'background_tasks') -and $null -ne $h.background_tasks) {
+            $bg = @($h.background_tasks)
+        }
+        if ($bg.Count -gt 0) { $head = 'Claude Code · 本轮结束（仍有 ' + $bg.Count + ' 个后台任务在跑）' }
+    }
+    'Notification' {
+        $sound  = 'Exclamation'
+        $detail = Get-Prop $h 'message'
+        if ($type -eq 'permission_prompt') { $head = 'Claude Code · 需要确认' }
+        elseif ($type -eq 'idle_prompt') { $head = 'Claude Code · 等待输入' }
+        else { $head = 'Claude Code · 需要注意' }
+    }
+    default {
+        $head   = 'Claude Code · ' + $event
+        $detail = Get-Prop $h 'message'
+    }
+}
+$detail = Clean $detail 140
+if (-not $detail) { $detail = '需要你看一眼' }
+
+# 同一 tag 的通知会被新的替换，通知中心只留最新一条；时间戳保证岛仔不会把它当成重复内容。
+# 小岛上的横幅只有一行，所以消息正文放最前，目录和时间放后面。
+$title = $head
+$body  = $detail
+if ($where) { $body = $body + ' · ' + $where }
+$body = $body + ' · ' + $stamp
+$tag   = 'ccstop'
+if ($event -eq 'Notification') { $tag = 'ccnote' }
+
+# 通知带上目标窗口：岛仔据此在右侧留下常驻入口，点击切回这个窗口。查不到就不带，行为与没有入口时相同。
+# 两种载体都带上：launch 属性（实测通知中心交回的对象读不到它）和正文末尾的标记（岛仔识别后会从显示里剔除）。
+$focus = Find-SessionWindow (Get-Prop $h 'session_id')
+$launch = ''
+$textFocus = ''
+if ($focus -gt 0) {
+    $launch = ' launch="daozai-focus:' + $focus + ':Claude Code"'
+    $textFocus = '<text>daozai-focus:' + $focus + ':Claude Code</text>'
+}
+
+# 用 ToastGeneric 模板：岛仔只读取这个模板里的文字。
+$xmlText = '<toast' + $launch + ' duration="short"><visual><binding template="ToastGeneric"><text>' +
+    [System.Security.SecurityElement]::Escape($title) + '</text><text>' +
+    [System.Security.SecurityElement]::Escape($body) + '</text>' + $textFocus + '</binding></visual></toast>'
+
+try {
+    # 借用 Windows PowerShell 自己的应用标识发通知，岛仔上显示的来源是「Windows PowerShell」。
+    $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+    [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    [void][Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml($xmlText)
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+    $toast.Tag = $tag
+    $toast.Group = 'ClaudeCode'
+    # 只进通知中心（供灵动岛读取），不弹 Windows 横幅。
+    $toast.SuppressPopup = $true
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+} catch { }
+
+# 横幅被抑制后系统不再响铃，提示音在这里播放；等它播完再退出，否则会被掐断。
+try { [System.Media.SystemSounds]::$sound.Play() } catch { }
+Start-Sleep -Milliseconds 900
+exit 0
+```
+
+## 附录 B：给用户的一页说明
+
+**装了什么**
+
+- 岛仔换成了带补丁的版本。补丁只加了一件事：通知里如果带着「目标窗口」，就在小岛右侧留一个可点击的图标。
+- Claude Code 多了一个钩子脚本，在回答结束、需要确认、长时间没人输入时发通知。脚本只读它自己的记录文件，不联网。
+
+**你会看到的**
+
+- 回答结束时小岛弹横幅、响一声，右边多一个橙色图标。点它回到终端；你自己切回终端，图标也会消失。
+- 如果在 Windows 通知中心里展开这条通知，会多出一行 `daozai-focus:…`，那是给岛仔认的标记。
+
+**要注意的**
+
+- 不要用岛仔的「检查更新」，更新后补丁就没了。
+- 锁屏、全屏程序在前台、或岛仔用「极简刘海」外观时，小岛本来就不显示。
+- 想关掉：岛仔设置 → 通知 → 「断开系统通知」，或删掉钩子（附录见第 7 节）。
+
+**还没在别的电脑上试过的**
+
+- 点图标切回窗口（编写时在编写者的机器上尚未验证完）。
+- Windows 弹出「通知访问权限」提示时的表现。
+- Windows 11、Windows Terminal 以外的终端。
